@@ -1,0 +1,16 @@
+{
+  "name": "nexus-compile-server",
+  "version": "1.0.0",
+  "description": "Cloud PROS compile server for Nexus web (Chromebook) clients",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
