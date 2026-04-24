@@ -296,6 +296,17 @@ all:
 \t@echo "Run 'pros make' with PROS CLI installed."
 `;
 
+// ── Static web app (serve nexus-web/ at root) ─────────────────────────────────
+// API routes above take priority; everything else falls through to the SPA.
+const PUBLIC_DIR = path.join(__dirname, 'public');
+if (fs.existsSync(PUBLIC_DIR)) {
+  app.use(express.static(PUBLIC_DIR));
+  app.get('*', (_req, res) => {
+    const index = path.join(PUBLIC_DIR, 'index.html');
+    fs.existsSync(index) ? res.sendFile(index) : res.status(404).send('Not found');
+  });
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
