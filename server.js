@@ -297,8 +297,12 @@ all:
 `;
 
 // ── Notebook publish / public view ────────────────────────────────────────────
-// Use a subdirectory of the app root so data survives Render spin-down/spin-up cycles.
-// (Only full redeploys reset the filesystem on Render free tier.)
+// Persistent storage via Supabase (set SUPABASE_URL + SUPABASE_ANON_KEY env vars).
+// Falls back to local filesystem when env vars are absent (local dev only —
+// Render's filesystem is ephemeral and will lose data on container restart).
+
+const SUPABASE_URL  = process.env.SUPABASE_URL;
+const SUPABASE_KEY  = process.env.SUPABASE_ANON_KEY;
 const NOTEBOOKS_DIR = process.env.NOTEBOOKS_DIR || path.join(__dirname, '_nb_data');
 fs.mkdirSync(NOTEBOOKS_DIR, { recursive: true });
 
@@ -306,28 +310,63 @@ function safeTeamCode(raw) {
   return String(raw || '').toUpperCase().replace(/[^A-Z0-9\-_]/g, '').slice(0, 20);
 }
 
+async function nbStore(teamCode, data) {
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/notebooks`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify({ team_code: teamCode, data: JSON.stringify(data), updated_at: new Date().toISOString() }),
+    });
+    if (!r.ok) throw new Error(`Supabase ${r.status}: ${await r.text()}`);
+  } else {
+    fs.writeFileSync(path.join(NOTEBOOKS_DIR, teamCode + '.json'), JSON.stringify(data), 'utf8');
+  }
+}
+
+async function nbFetch(teamCode) {
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/notebooks?team_code=eq.${encodeURIComponent(teamCode)}&select=data&limit=1`,
+      { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } }
+    );
+    if (!r.ok) throw new Error(`Supabase ${r.status}`);
+    const rows = await r.json();
+    if (!rows.length) return null;
+    return JSON.parse(rows[0].data);
+  } else {
+    const filePath = path.join(NOTEBOOKS_DIR, teamCode + '.json');
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  }
+}
+
 // POST /nb/publish — team publishes current notebook snapshot
-app.post('/nb/publish', (req, res) => {
+app.post('/nb/publish', async (req, res) => {
   const { teamCode, data } = req.body || {};
   const code = safeTeamCode(teamCode);
   if (!code) return res.status(400).json({ error: 'Invalid team code' });
   if (!data || typeof data !== 'object') return res.status(400).json({ error: 'Missing data' });
   try {
-    fs.writeFileSync(path.join(NOTEBOOKS_DIR, code + '.json'), JSON.stringify(data), 'utf8');
+    await nbStore(code, data);
     res.json({ ok: true, teamCode: code });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /nb/data/:teamCode — public read of the published notebook (no auth required)
-app.get('/nb/data/:teamCode', (req, res) => {
+app.get('/nb/data/:teamCode', async (req, res) => {
   const code = safeTeamCode(req.params.teamCode);
   if (!code) return res.status(400).json({ error: 'Invalid team code' });
-  const filePath = path.join(NOTEBOOKS_DIR, code + '.json');
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'No published notebook for this team' });
   try {
+    const data = await nbFetch(code);
+    if (!data) return res.status(404).json({ error: 'No published notebook for this team' });
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(fs.readFileSync(filePath, 'utf8'));
+    res.json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
