@@ -15,12 +15,20 @@ const setN=(m,t,d)=>{S.notes[nk(m,t)]=d;sn2();};
 
 // ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
 let currentUser=null;
-function initGoogleAuth(){renderAuthBar(null);}
+window.currentUser=null;
+async function initGoogleAuth(){
+  renderAuthBar(null);
+  const token=localStorage.getItem('gToken');
+  if(token){
+    try{await fetchGoogleUser(token);}
+    catch(e){localStorage.removeItem('gToken');renderAuthBar(null);}
+  }
+}
 async function signInGoogle(){
   const evIn=document.getElementById('evIn');
   const sku=(evIn&&evIn.closest('#scoutPage')?.style.display!=='none')?evIn.value:'';
   if(sku)sessionStorage.setItem('nexus_restore_sku',sku);
-  const p=new URLSearchParams({client_id:S.gid,redirect_uri:'https://vexscout.vercel.app/',response_type:'token',scope:'openid email profile',prompt:'select_account'});
+  const p=new URLSearchParams({client_id:S.gid,redirect_uri:'https://vexscout.vercel.app/',response_type:'token',scope:'openid email profile https://www.googleapis.com/auth/drive.file',prompt:'select_account'});
   const authUrl='https://accounts.google.com/o/oauth2/v2/auth?'+p.toString();
   if(IS_ELECTRON&&window.electronAPI?.googleAuth){
     try{
@@ -40,23 +48,27 @@ async function checkAuthRedirect(){
   const token=params.get('access_token');
   window.history.replaceState(null,'',window.location.pathname);
   if(token){
-    await fetchGoogleUser(token);
-    const saved=sessionStorage.getItem('nexus_restore_sku');
-    if(saved){sessionStorage.removeItem('nexus_restore_sku');const inp=document.getElementById('evIn');if(inp){inp.value=saved;setTimeout(()=>loadEvent(),500);}}
+    try{
+      await fetchGoogleUser(token);
+      const saved=sessionStorage.getItem('nexus_restore_sku');
+      if(saved){sessionStorage.removeItem('nexus_restore_sku');const inp=document.getElementById('evIn');if(inp){inp.value=saved;setTimeout(()=>loadEvent(),500);}}
+    }catch(e){setSt('Sign-in failed: '+e.message,'idle');}
   }
 }
 async function fetchGoogleUser(token){
-  try{
-    const res=await fetch('https://www.googleapis.com/oauth2/v3/userinfo',{headers:{Authorization:'Bearer '+token}});
-    const u=await res.json();
-    currentUser={uid:u.sub,displayName:u.name,email:u.email,photoURL:u.picture,accessToken:token};
-    S.notesKey='vs_n_'+currentUser.uid;
-    try{const n=ls(S.notesKey);if(n)Object.assign(S.notes,JSON.parse(n));}catch{}
-    renderAuthBar(currentUser);
-    setSt('Signed in as '+currentUser.displayName,'live');
-  }catch(e){setSt('Could not fetch user info: '+e.message,'idle');}
+  const res=await fetch('https://www.googleapis.com/oauth2/v3/userinfo',{headers:{Authorization:'Bearer '+token}});
+  if(!res.ok)throw new Error('Token invalid or expired ('+res.status+')');
+  const u=await res.json();
+  if(!u.sub)throw new Error('Invalid user info response');
+  currentUser={uid:u.sub,displayName:u.name,email:u.email,photoURL:u.picture,accessToken:token};
+  window.currentUser=currentUser;
+  localStorage.setItem('gToken',token);
+  S.notesKey='vs_n_'+currentUser.uid;
+  try{const n=ls(S.notesKey);if(n)Object.assign(S.notes,JSON.parse(n));}catch{}
+  renderAuthBar(currentUser);
+  setSt('Signed in as '+currentUser.displayName,'live');
 }
-function signOutGoogle(){currentUser=null;S.notesKey='vs_n';renderAuthBar(null);setSt('Signed out','idle');}
+function signOutGoogle(){currentUser=null;window.currentUser=null;localStorage.removeItem('gToken');S.notesKey='vs_n';renderAuthBar(null);setSt('Signed out','idle');}
 function renderAuthBar(user){
   const signedInHtml=user?`<img src="${user.photoURL||''}" style="width:24px;height:24px;border-radius:50%;object-fit:cover;flex-shrink:0;" onerror="this.style.display='none'"/>
       <span style="font-size:12px;color:var(--t2);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${user.displayName||user.email}</span>
@@ -67,7 +79,7 @@ function renderAuthBar(user){
   document.querySelectorAll('.auth-area').forEach(el=>el.innerHTML=signedInHtml);
   // Push auth state to the notebook iframe if it's loaded
   const nbFrame=document.getElementById('notebookFrame');
-  if(nbFrame?.contentWindow)nbFrame.contentWindow.postMessage({type:'auth-update',user:user?{displayName:user.displayName,email:user.email,photoURL:user.photoURL}:null},'*');
+  if(nbFrame?.contentWindow)nbFrame.contentWindow.postMessage({type:'auth-update',user:user?{uid:user.uid,displayName:user.displayName,email:user.email,photoURL:user.photoURL,accessToken:user.accessToken}:null},'*');
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
@@ -494,7 +506,22 @@ function enterApp(section) {
   else if (section === 'simulator') openSimulator();
   else if (section === 'ide')       openIDE();
 }
-function openNotebook(){const p=document.getElementById('notebookPage'),f=document.getElementById('notebookFrame');if(!f.src)f.src='notebook.html';p.style.display='flex';}
+function openNotebook(){
+  const p=document.getElementById('notebookPage'),f=document.getElementById('notebookFrame');
+  if(!f.src){
+    f.src='nexus-web/notebook.html';
+    f.addEventListener('load',()=>{
+      if(f.contentWindow){
+        f.contentWindow.postMessage({type:'auth-update',user:currentUser?{uid:currentUser.uid,displayName:currentUser.displayName,email:currentUser.email,photoURL:currentUser.photoURL,accessToken:currentUser.accessToken}:null},'*');
+        f.contentWindow.postMessage({type:'team-update',team:ls('vs_myteam')||''},'*');
+      }
+    },{once:true});
+  }else if(f.contentWindow){
+    f.contentWindow.postMessage({type:'auth-update',user:currentUser?{uid:currentUser.uid,displayName:currentUser.displayName,email:currentUser.email,photoURL:currentUser.photoURL,accessToken:currentUser.accessToken}:null},'*');
+    f.contentWindow.postMessage({type:'team-update',team:ls('vs_myteam')||''},'*');
+  }
+  p.style.display='flex';
+}
 function closeNotebook(){document.getElementById('notebookPage').style.display='none';const hp=document.getElementById('homePage');if(hp)hp.style.display='flex';}
 function navigateTo(section) {
   if (section !== 'notebook') closeNotebook();

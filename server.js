@@ -296,6 +296,39 @@ all:
 \t@echo "Run 'pros make' with PROS CLI installed."
 `;
 
+// ── Notebook publish / public view ────────────────────────────────────────────
+const NOTEBOOKS_DIR = process.env.NOTEBOOKS_DIR || path.join(os.tmpdir(), 'nexus-notebooks');
+fs.mkdirSync(NOTEBOOKS_DIR, { recursive: true });
+
+function safeTeamCode(raw) {
+  return String(raw || '').toUpperCase().replace(/[^A-Z0-9\-_]/g, '').slice(0, 20);
+}
+
+// POST /nb/publish — team publishes current notebook snapshot
+app.post('/nb/publish', (req, res) => {
+  const { teamCode, data } = req.body || {};
+  const code = safeTeamCode(teamCode);
+  if (!code) return res.status(400).json({ error: 'Invalid team code' });
+  if (!data || typeof data !== 'object') return res.status(400).json({ error: 'Missing data' });
+  try {
+    fs.writeFileSync(path.join(NOTEBOOKS_DIR, code + '.json'), JSON.stringify(data), 'utf8');
+    res.json({ ok: true, teamCode: code });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /nb/data/:teamCode — public read of the published notebook (no auth required)
+app.get('/nb/data/:teamCode', (req, res) => {
+  const code = safeTeamCode(req.params.teamCode);
+  if (!code) return res.status(400).json({ error: 'Invalid team code' });
+  const filePath = path.join(NOTEBOOKS_DIR, code + '.json');
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'No published notebook for this team' });
+  try {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Static web app (serve nexus-web/ at root) ─────────────────────────────────
 // API routes above take priority; everything else falls through to the SPA.
 const PUBLIC_DIR = path.join(__dirname, 'public');

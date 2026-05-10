@@ -88,16 +88,13 @@ const SIM = {
   // Telemetry recording
   telemetry: { recording: false, buffer: [], sessionId: null, mode: null, _tick: 0 },
 
-  // Hopper score counters (reset each match)
+  // Match score (recalculated each tick from goal state)
   score: { player: 0, opponent: 0 },
 
-  // Ball wave tracking — waves respawn after every clear
-  ballWave: { count: 1, _respawnTimer: 0 },
-
-  // Game-mechanic runtime state
-  cargo: { playerHeld: 0, playerCapacity: 4, scoreCooldown: 0, shotCooldown: 0, playerBalls: [] },
-  climb: { player: { progress: 0, latched: false, scored: false, side: null } },
-  controls: { climbPressed: false },
+  // Override game state
+  override: { heldPieces: [], expanded: false, rollerPos: 0, matchloadsLeft: 40 },
+  toggleOwner: { left: null, right: null, top: null, bottom: null },
+  goals: [],   // populated by loadDefaultGameObjects
 
   // Runtime-only visuals attached to the player robot group
   playerOverlayGroup: null,
@@ -107,29 +104,54 @@ const SIM = {
 const FIELD_IN = 144;
 const FIELD_SCALE = 0.1; // 1 inch = 0.1 Three.js units → field = 14.4 units
 
-// Test-game layout constants
-const HOPPER_X      = FIELD_IN / 2;   // center of field
-const HOPPER_Y      = FIELD_IN / 2;
-const HOPPER_RADIUS = 13;             // inches — ball counts as scored when within this radius
-const BALL_RAD      = 2;              // 4" ball half-diameter
-const PUSH_DIST     = 12;             // robot-center to ball edge push threshold (in)
-const LADDER_BLUE   = { x: 16,  y: 72 };   // middle of left wall — player's alliance
-const LADDER_RED    = { x: 128, y: 72 };   // middle of right wall — opponent alliance
-const PLAYER_PICKUP_RANGE     = 12;
+// V5RC Override — field layout
+// 8 short goals arranged in an octagonal ring (r≈38") centred on (72,72),
+// two per X-diagonal quadrant; blue=left, red=right, neutral=top/bottom.
+const OVERRIDE_GOALS = [
+  { x: 72,  y: 72,  type: 'center',  team: 'neutral' }, // center goal — 8.7"
+  { x: 37,  y: 87,  type: 'alliance', team: 'blue'   }, // left quadrant (NW) — 3.25"
+  { x: 37,  y: 57,  type: 'alliance', team: 'blue'   }, // left quadrant (SW) — 3.25"
+  { x: 107, y: 87,  type: 'alliance', team: 'red'    }, // right quadrant (NE) — 3.25"
+  { x: 107, y: 57,  type: 'alliance', team: 'red'    }, // right quadrant (SE) — 3.25"
+  { x: 57,  y: 107, type: 'neutral', team: 'neutral' }, // top quadrant (NW) — 5.8"
+  { x: 87,  y: 107, type: 'neutral', team: 'neutral' }, // top quadrant (NE) — 5.8"
+  { x: 57,  y: 37,  type: 'neutral', team: 'neutral' }, // bottom quadrant (SW) — 5.8"
+  { x: 87,  y: 37,  type: 'neutral', team: 'neutral' }, // bottom quadrant (SE) — 5.8"
+];
+const OVERRIDE_TOGGLES = [
+  { id: 'left',   x: 3,   y: 72,  quad: 'left'   },
+  { id: 'right',  x: 141, y: 72,  quad: 'right'  },
+  { id: 'top',    x: 72,  y: 141, quad: 'top'    },
+  { id: 'bottom', x: 72,  y: 3,   quad: 'bottom' },
+];
+
+// V5RC Override — gameplay constants
+const PLAYER_PICKUP_RANGE      = 14;
 const PLAYER_PICKUP_FRONT_BIAS = 10;
-const HOPPER_SCORE_INTERVAL   = 0.28;
-const PLAYER_SHOT_RANGE       = 84;
-const PLAYER_SHOT_INTERVAL    = 0.42;
-const PLAYER_SHOT_ARC         = 14;
-const CLIMB_BAR_HEIGHT        = 18;
-const CLIMB_BAR_HALF_SPAN     = 12;
-const HOPPER_SOLID_RADIUS     = HOPPER_RADIUS + 3.5;
-const HOPPER_APPROACH_RADIUS  = HOPPER_SOLID_RADIUS + 6;
-const CLIMB_POST_SOLID_RADIUS = 3.2;
-const CLIMB_LOCK_RANGE        = 10;
-const CLIMB_LOCK_SPEED        = 6;
-const CLIMB_CHARGE_TIME       = 1.2;
-const CLIMB_SCORE_BONUS       = 12;
+const PIECE_PUSH_DIST          = 10;
+const GOAL_SCORE_RADIUS        = 14;
+const GOAL_SOLID_RADIUS        = 7;
+const GOAL_APPROACH_OFFSET     = GOAL_SOLID_RADIUS + 8;
+const TOGGLE_CAPTURE_RADIUS    = 10;
+const MIDFIELD_RADIUS          = 20;
+const MIDFIELD_BONUS           = 8;
+const SIM_AUTON_BONUS          = 12;
+const PIN_SCORE_ALLIANCE       = 5;
+const PIN_SCORE_YELLOW         = 10;
+const CUP_SCORE_VALUE          = 2;
+const PIN_HEIGHT               = 6.5;  // inches — Appendix B: 165 mm
+const CUP_HEIGHT               = 6.5;  // inches — Appendix B: 164.5 mm
+const GOAL_HEIGHT_CENTER       = 8.7;  // inches — center goal (Appendix B)
+const GOAL_HEIGHT_NEUTRAL      = 5.8;  // inches — neutral quadrant goals
+const GOAL_HEIGHT_ALLIANCE     = 3.25; // inches — alliance goals
+const ROLLER_POSITIONS         = ['Out', 'Mid', 'In'];
+
+function getQuadrant(x, y) {
+  if (x < y && x < FIELD_IN - y) return 'left';
+  if (x > y && x > FIELD_IN - y) return 'right';
+  if (y < x && y < FIELD_IN - x) return 'bottom';
+  return 'top';
+}
 
 function inToWorld(inches) { return inches * FIELD_SCALE; }
 function worldToIn(world)  { return world / FIELD_SCALE; }
@@ -139,11 +161,25 @@ function openSimulator() {
   const page = document.getElementById('simPage');
   if (!page) return;
   page.style.display = 'flex';
-  if (!SIM.renderer) initSimRenderer();
+  const firstOpen = !SIM.renderer;
+  if (firstOpen) initSimRenderer();
   else if (!SIM.animId) simRenderLoop();
   if (!SIM.gameObjects.length || !SIM.gameObjectsGroup?.children?.length) loadDefaultGameObjects();
+  if (firstOpen) simRenderOdomConfig();
   simResetRobot();
   simUpdateSidebar();
+  // Deferred resize: if the canvas was 0×0 at init time (display:none → flex
+  // transition hasn't reflowed yet), correct the renderer size on the next frame.
+  requestAnimationFrame(() => {
+    const vp = document.getElementById('simViewport');
+    if (SIM.renderer && vp && vp.offsetWidth > 0 && vp.offsetHeight > 0) {
+      SIM.renderer.setSize(vp.offsetWidth, vp.offsetHeight);
+      if (SIM.camera) {
+        SIM.camera.aspect = vp.offsetWidth / vp.offsetHeight;
+        SIM.camera.updateProjectionMatrix();
+      }
+    }
+  });
 }
 
 function closeSimulator() {
@@ -157,18 +193,34 @@ function closeSimulator() {
 }
 
 // ─── RENDERER INIT ────────────────────────────────────────────────────────────
+function _simDiag(msg) {
+  const el = document.getElementById('simDiagMsg');
+  if (el) el.textContent = msg;
+}
+function _simDiagHide() {
+  const el = document.getElementById('simDiag');
+  if (el) el.style.display = 'none';
+}
+
 function initSimRenderer() {
-  if (typeof THREE === 'undefined') return;
+  _simDiag('Checking Three.js…');
+  if (typeof THREE === 'undefined') {
+    _simDiag('⚠ Three.js failed to load.\nCheck internet connection or open DevTools console.');
+    simSetStatus('⚠ Three.js not loaded — check network/console');
+    return;
+  }
 
   const canvas = document.getElementById('simCanvas');
   const vp     = document.getElementById('simViewport');
+  _simDiag('Creating renderer… (viewport ' + vp.offsetWidth + '×' + vp.offsetHeight + ')');
 
   SIM.scene = new THREE.Scene();
   SIM.scene.background = new THREE.Color(0x0a0a10);
   SIM.target = new THREE.Vector3(inToWorld(72), 0, inToWorld(72));
 
-  // Camera
-  SIM.camera = new THREE.PerspectiveCamera(50, vp.offsetWidth / vp.offsetHeight, 0.01, 500);
+  // Camera — use a safe fallback aspect ratio if the viewport hasn't laid out yet
+  const initAspect = vp.offsetHeight > 0 ? vp.offsetWidth / vp.offsetHeight : 16 / 9;
+  SIM.camera = new THREE.PerspectiveCamera(50, initAspect, 0.01, 500);
   simUpdateCamera();
 
   // Renderer
@@ -176,6 +228,7 @@ function initSimRenderer() {
   SIM.renderer.setPixelRatio(window.devicePixelRatio);
   SIM.renderer.setSize(vp.offsetWidth, vp.offsetHeight);
   SIM.renderer.shadowMap.enabled = true;
+  _simDiag('Renderer OK (' + vp.offsetWidth + '×' + vp.offsetHeight + ')\nBuilding scene…');
 
   // Lights
   const ambient = new THREE.AmbientLight(0xffffff, 0.5);
@@ -192,16 +245,16 @@ function initSimRenderer() {
   SIM.scene.add(SIM.fieldGroup, SIM.group, SIM.gameObjectsGroup);
 
   // Build procedural field
-  buildField();
+  try { buildField(); } catch (e) { console.error('buildField failed:', e); _simDiag('⚠ buildField error:\n' + e.message); simSetStatus('⚠ Field error: ' + e.message); }
 
   // Default robot placeholder (blue box) — replaced when OBJ is loaded
-  buildDefaultRobot();
+  try { buildDefaultRobot(); } catch (e) { console.error('buildDefaultRobot failed:', e); _simDiag('⚠ buildDefaultRobot error:\n' + e.message); }
 
   // AI robots
-  buildAIRobots();
+  try { buildAIRobots(); } catch (e) { console.error('buildAIRobots failed:', e); _simDiag('⚠ buildAIRobots error:\n' + e.message); }
 
   // Field game elements
-  loadDefaultGameObjects();
+  try { loadDefaultGameObjects(); } catch (e) { console.error('loadDefaultGameObjects failed:', e); _simDiag('⚠ loadDefaultGameObjects error:\n' + e.message); simSetStatus('⚠ Game objects error: ' + e.message); }
 
   // Controls
   canvas.addEventListener('mousedown', e => {
@@ -236,7 +289,12 @@ function initSimRenderer() {
   document.addEventListener('keydown', e => {
     if (!_simKeyPage || _simKeyPage.style.display === 'none') return;
     SIM.keys[e.key.toLowerCase()] = true;
+    const k = e.key.toLowerCase();
     if (e.key === ' ') { simKeyTogglePistons(); e.preventDefault(); }
+    if (k === 'e') simExpand();
+    if (k === 'c') simCompress();
+    if (k === 'r') simCycleRoller();
+    if (k === 'm') { simMatchload(); e.preventDefault(); }
   });
   document.addEventListener('keyup', e => {
     if (!_simKeyPage || _simKeyPage.style.display === 'none') return;
@@ -258,6 +316,8 @@ function initSimRenderer() {
   // Start render + physics loop
   simRenderLoop();
   setInterval(simPhysicsTick, 16); // ~60fps physics
+  simSetStatus('No config loaded');
+  _simDiagHide(); // hide diagnostic overlay — renderer is live
 }
 
 function simUpdateCamera() {
@@ -308,27 +368,31 @@ function buildField() {
     SIM.fieldGroup.add(m);
   });
 
-  // Alliance half-field overlays — blue (far, z > FW/2) and red (near, z < FW/2)
-  const blueHalf = new THREE.Mesh(
-    new THREE.PlaneGeometry(FW, FW / 2),
-    new THREE.MeshBasicMaterial({ color: 0x1a4a8a, transparent: true, opacity: 0.18, depthWrite: false })
+  // Override: blue (left) and red (right) alliance quadrant tints
+  const blueQuad = new THREE.Mesh(
+    new THREE.PlaneGeometry(FW / 2, FW),
+    new THREE.MeshBasicMaterial({ color: 0x1a4a8a, transparent: true, opacity: 0.14, depthWrite: false })
   );
-  blueHalf.rotation.x = -Math.PI / 2;
-  blueHalf.position.set(FW / 2, 0.003, FW * 3 / 4);
-  SIM.fieldGroup.add(blueHalf);
+  blueQuad.rotation.x = -Math.PI / 2;
+  blueQuad.position.set(FW / 4, 0.003, FW / 2);
+  SIM.fieldGroup.add(blueQuad);
 
-  const redHalf = new THREE.Mesh(
-    new THREE.PlaneGeometry(FW, FW / 2),
-    new THREE.MeshBasicMaterial({ color: 0x8a1a1a, transparent: true, opacity: 0.18, depthWrite: false })
+  const redQuad = new THREE.Mesh(
+    new THREE.PlaneGeometry(FW / 2, FW),
+    new THREE.MeshBasicMaterial({ color: 0x8a1a1a, transparent: true, opacity: 0.14, depthWrite: false })
   );
-  redHalf.rotation.x = -Math.PI / 2;
-  redHalf.position.set(FW / 2, 0.003, FW / 4);
-  SIM.fieldGroup.add(redHalf);
+  redQuad.rotation.x = -Math.PI / 2;
+  redQuad.position.set(FW * 3 / 4, 0.003, FW / 2);
+  SIM.fieldGroup.add(redQuad);
 
-  // Center divider line
-  const divMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
-  SIM.fieldGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(
-    [new THREE.Vector3(0, 0.006, FW / 2), new THREE.Vector3(FW, 0.006, FW / 2)]), divMat));
+  // X-pattern diagonal lines corner-to-corner
+  const diagMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+  SIM.fieldGroup.add(
+    new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(0, 0.006, 0), new THREE.Vector3(FW, 0.006, FW)]), diagMat),
+    new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(FW, 0.006, 0), new THREE.Vector3(0, 0.006, FW)]), diagMat)
+  );
 
   // Tile grid — 24" squares, light contrast lines on gray floor
   const lineMat  = new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.6 });
@@ -370,8 +434,7 @@ function simPositionRobotMesh() {
   if (!SIM.group) return;
   const wx = inToWorld(SIM.robot.x);
   const wz = inToWorld(SIM.robot.y); // Y in field = Z in world
-  const lift = simGetClimbLift(SIM.climb.player);
-  SIM.group.position.set(wx, inToWorld(lift), wz);
+  SIM.group.position.set(wx, 0, wz);
   SIM.group.rotation.y = -SIM.robot.angle * Math.PI / 180;
 }
 
@@ -396,15 +459,12 @@ function buildAIRobot(color, arrowColor) {
 }
 
 function buildAIRobots() {
-  const half = 8.5; // default half-size + margin
-  const margin = half + 2;
-  const mid    = FIELD_IN / 2;
-  // Robots start at the midpoint of each wall, facing inward.
-  // Field is split diagonally (y=x line): blue side = y>x, red side = y<x.
+  const margin = 12;
+  // Blue AI: left side (player's alliance). Red AIs: right side.
   const defs = [
-    { x: mid,             y: FIELD_IN - margin, angle:   0, team: 'blue', color: 0x3B82F6, arrow: 0xdbeafe, role: 'scorer' }, // teammate  — middle of top wall, facing down
-    { x: FIELD_IN - margin, y: mid,             angle: -90, team: 'red',  color: 0xEF4444, arrow: 0xfee2e2, role: 'scorer' }, // opp 1    — middle of right wall, facing left
-    { x: mid,             y: margin,            angle: 180, team: 'red',  color: 0xB91C1C, arrow: 0xfca5a5, role: 'harass' }, // opp 2    — middle of bottom wall, facing up
+    { x: margin,             y: 90,             angle:  90, team: 'blue', color: 0x3B82F6, arrow: 0xdbeafe, role: 'scorer' },
+    { x: FIELD_IN - margin,  y: 54,             angle: -90, team: 'red',  color: 0xEF4444, arrow: 0xfee2e2, role: 'scorer' },
+    { x: FIELD_IN - margin,  y: 90,             angle: -90, team: 'red',  color: 0xB91C1C, arrow: 0xfca5a5, role: 'harass' },
   ];
   SIM.aiRobots = defs.map(d => {
     const group = buildAIRobot(d.color, d.arrow);
@@ -416,11 +476,9 @@ function buildAIRobots() {
       group,
       startX: d.x, startY: d.y, startAngle: d.angle,
       targetX: d.x, targetY: d.y,
-      mlAction: null,  // {leftV, rightV} when ML-controlled; null = wander AI
-      _cargoCount: 0,
-      _scoreCooldown: 0,
-      _cargoBalls: [],
-      _climb: { progress: 0, latched: false, scored: false, side: d.team },
+      mlAction: null,
+      _heldPieces: [],
+      _targetPiece: null,
     };
     positionAIRobot(ai);
     return ai;
@@ -428,20 +486,18 @@ function buildAIRobots() {
 }
 
 function positionAIRobot(ai) {
-  ai.group.position.set(inToWorld(ai.x), inToWorld(simGetClimbLift(ai._climb)), inToWorld(ai.y));
+  ai.group.position.set(inToWorld(ai.x), 0, inToWorld(ai.y));
   ai.group.rotation.y = -ai.angle * Math.PI / 180;
 }
 
-function simGetHopperApproachPoint(entity) {
-  const ex = entity?.x ?? HOPPER_X;
-  const ey = entity?.y ?? HOPPER_Y;
-  let dx = ex - HOPPER_X;
-  let dy = ey - HOPPER_Y;
+function simGetGoalApproachPoint(goal, entity) {
+  let dx = (entity?.x ?? goal.x) - goal.x;
+  let dy = (entity?.y ?? goal.y) - goal.y;
   const mag = Math.hypot(dx, dy) || 1;
   dx /= mag; dy /= mag;
   return {
-    x: HOPPER_X + dx * HOPPER_APPROACH_RADIUS,
-    y: HOPPER_Y + dy * HOPPER_APPROACH_RADIUS,
+    x: goal.x + dx * GOAL_APPROACH_OFFSET,
+    y: goal.y + dy * GOAL_APPROACH_OFFSET,
   };
 }
 
@@ -490,71 +546,60 @@ async function simLoadAdaptiveData() {
 
 // ── AI objective state machine ────────────────────────────────────────────────
 function updateAIObjective(ai) {
-  if (ai._climb?.latched) return; // robot is hanging — tickAIRobot zeroes velocity
-
   const timeLeft = SIM.match.duration - SIM.match.elapsed;
+  const held = ai._heldPieces || (ai._heldPieces = []);
 
-  // Last 20s: go climb
-  if (timeLeft <= 20) {
-    if (ai._state !== 'climb') {
-      ai._state = 'climb';
-      const ldr = ai.team === 'blue' ? LADDER_BLUE : LADDER_RED;
-      ai.targetX = ldr.x; ai.targetY = ldr.y;
+  // Last 15s: rush midfield
+  if (timeLeft <= 15) {
+    if (ai._state !== 'midfield') {
+      ai._state = 'midfield';
+      ai.targetX = FIELD_IN / 2;
+      ai.targetY = FIELD_IN / 2;
     }
     return;
   }
 
-  // Delivering to hopper — trigger when full, running low on time, or no balls left
-  const noBallsLeft = !SIM.gameObjects.some(o => o.type === 'ball' && !o.scored && !o.carriedBy);
-  const shouldDeliver = ai._cargoCount > 0 && (ai._cargoCount >= 4 || timeLeft <= 28 || noBallsLeft);
+  // Full or time pressure — go score
+  const noPiecesLeft = !SIM.gameObjects.some(o => (o.type === 'pin' || o.type === 'cup') && !o.scored && !o.carriedBy);
+  const shouldDeliver = held.length > 0 && (held.length >= 3 || timeLeft <= 30 || noPiecesLeft);
   if (shouldDeliver) {
-    const approach = simGetHopperApproachPoint(ai);
-    ai._state = 'score';
-    ai.targetX = approach.x;
-    ai.targetY = approach.y;
-    if (Math.hypot(approach.x - ai.x, approach.y - ai.y) < 7) {
-      ai._scoreCooldown -= TICK_DT;
-      if (ai._scoreCooldown <= 0 && ai._cargoBalls.length) {
-        const ball = ai._cargoBalls.shift();
-        ball.scored = true;
-        ball.carriedBy = null;
-        ball.mesh.visible = false;
-        if (ai.team === 'blue') SIM.score.player++;
-        else SIM.score.opponent++;
-        ai._cargoCount--;
-        ai._scoreCooldown = HOPPER_SCORE_INTERVAL;
-      }
-      if (!ai._cargoCount) {
-        ai._cargoBall = null;
-        ai._state = null;
-      }
+    const teamGoals = SIM.goals.filter(g => g.team === ai.team || g.team === 'neutral');
+    const nearestGoal = teamGoals
+      .map(g => ({ g, d: Math.hypot(ai.x - g.x, ai.y - g.y) }))
+      .sort((a, b) => a.d - b.d)[0];
+    if (nearestGoal) {
+      const approach = simGetGoalApproachPoint(nearestGoal.g, ai);
+      ai._state = 'score';
+      ai.targetX = approach.x;
+      ai.targetY = approach.y;
     }
     return;
   }
 
-  // Ball was scored or captured by someone else while we were chasing it
-  if (ai._state === 'collect' && (ai._targetBall?.scored || (ai._targetBall?.carriedBy && ai._targetBall.carriedBy !== ai))) {
-    ai._state = null; ai._targetBall = null;
+  // Piece was taken while we were chasing it — reset
+  if (ai._state === 'collect' && ai._targetPiece) {
+    if (ai._targetPiece.scored || (ai._targetPiece.carriedBy && ai._targetPiece.carriedBy !== ai)) {
+      ai._state = null; ai._targetPiece = null;
+    }
   }
 
-  // Tracking toward a ball
-  if (ai._state === 'collect' && ai._targetBall) {
-    ai.targetX = ai._targetBall.x;
-    ai.targetY = ai._targetBall.y;
-    if (Math.hypot(ai._targetBall.x - ai.x, ai._targetBall.y - ai.y) < 14) {
-      const ball = ai._targetBall;
-      ball.carriedBy = ai;
-      ball.mesh.visible = false;
-      ai._cargoBalls.push(ball);
-      ai._cargoCount = Math.min(4, ai._cargoCount + 1);
-      ai._cargoBall = ball;
-      ai._targetBall = null;
-      ai._state = ai._cargoCount >= 4 ? 'score' : null;
+  // Tracking toward a piece — pick up when close
+  if (ai._state === 'collect' && ai._targetPiece) {
+    ai.targetX = ai._targetPiece.x;
+    ai.targetY = ai._targetPiece.y;
+    if (Math.hypot(ai._targetPiece.x - ai.x, ai._targetPiece.y - ai.y) < 14) {
+      const piece = ai._targetPiece;
+      piece.carriedBy = ai;
+      piece.mesh.visible = false;
+      held.push(piece);
+      ai._targetPiece = null;
+      ai._state = held.length >= 3 ? 'score' : null;
     }
     return;
   }
 
-  if (ai.role === 'harass' && SIM_AI_WEAKNESS?.analyzed && timeLeft > 28 && !ai._cargoCount) {
+  // Harass: pressure player toward pieces they tend to ignore
+  if (ai.role === 'harass' && SIM_AI_WEAKNESS?.analyzed && timeLeft > 30 && held.length === 0) {
     const player = SIM.robot;
     const hot = SIM_AI_WEAKNESS.hotZones?.length
       ? SIM_AI_WEAKNESS.hotZones.reduce((best, z) => {
@@ -562,28 +607,26 @@ function updateAIObjective(ai) {
           return d < best.d ? { z, d } : best;
         }, { z: null, d: Infinity }).z
       : null;
-    const px = hot ? (player.x + hot.cx) * 0.5 : player.x;
-    const py = hot ? (player.y + hot.cy) * 0.5 : player.y;
     ai._state = 'pressure';
-    ai.targetX = px;
-    ai.targetY = py;
+    ai.targetX = hot ? (player.x + hot.cx) * 0.5 : player.x;
+    ai.targetY = hot ? (player.y + hot.cy) * 0.5 : player.y;
     return;
   }
 
-  // Acquire next target ball
-  const balls = SIM.gameObjects.filter(o => o.type === 'ball' && !o.scored && !o.carriedBy);
-  if (!balls.length) {
-    // All balls gone — climb early
-    ai._state = 'climb';
-    const ldr = ai.team === 'blue' ? LADDER_BLUE : LADDER_RED;
-    ai.targetX = ldr.x; ai.targetY = ldr.y;
+  // Acquire nearest unclaimed piece
+  const pieces = SIM.gameObjects.filter(o =>
+    (o.type === 'pin' || o.type === 'cup') && !o.scored && !o.carriedBy
+  );
+  if (!pieces.length) {
+    ai._state = 'midfield';
+    ai.targetX = FIELD_IN / 2;
+    ai.targetY = FIELD_IN / 2;
     return;
   }
 
   let best = null;
   if (SIM_AI_WEAKNESS?.analyzed && SIM_AI_WEAKNESS.weakZones.length) {
-    // Prefer balls near the player's weak zones (player is unlikely to contest them)
-    best = balls.reduce((acc, o) => {
+    best = pieces.reduce((acc, o) => {
       const weakScore = SIM_AI_WEAKNESS.weakZones.reduce((s, wz) =>
         s + 1 / (1 + Math.hypot(o.x - wz.cx, o.y - wz.cy)), 0);
       const aiDist = Math.hypot(o.x - ai.x, o.y - ai.y);
@@ -592,13 +635,13 @@ function updateAIObjective(ai) {
     }, { o: null, score: -Infinity }).o;
   }
   if (!best) {
-    best = balls.reduce((acc, o) => {
+    best = pieces.reduce((acc, o) => {
       const d = Math.hypot(o.x - ai.x, o.y - ai.y);
       return d < acc.d ? { o, d } : acc;
     }, { o: null, d: Infinity }).o;
   }
 
-  ai._targetBall = best;
+  ai._targetPiece = best;
   ai._state = 'collect';
   ai.targetX = best.x;
   ai.targetY = best.y;
@@ -606,11 +649,6 @@ function updateAIObjective(ai) {
 
 function tickAIRobot(ai) {
   updateAIObjective(ai);
-
-  if (ai._climb?.latched) {
-    ai.vx = 0; ai.vy = 0; ai.omega = 0;
-    return;
-  }
 
   const dx = ai.targetX - ai.x;
   const dy = ai.targetY - ai.y;
@@ -620,7 +658,7 @@ function tickAIRobot(ai) {
   ai._stallTimer = (ai._stallTimer || 0) + TICK_DT;
   const aiSpd = Math.sqrt(ai.vx * ai.vx + ai.vy * ai.vy);
   if (ai._stallTimer > 2.0 && dist > 20 && aiSpd < 2) {
-    ai._state = null; ai._targetBall = null; ai._stallTimer = 0;
+    ai._state = null; ai._targetPiece = null; ai._stallTimer = 0;
   }
 
   // Speed boost when adaptive mode is active
@@ -657,30 +695,9 @@ function tickAIRobot(ai) {
   if (nx < hx || nx > FIELD_IN - hx) { ai.vx = 0; nx = Math.max(hx, Math.min(FIELD_IN - hx, nx)); hitWall = true; }
   if (ny < hy || ny > FIELD_IN - hy) { ai.vy = 0; ny = Math.max(hy, Math.min(FIELD_IN - hy, ny)); hitWall = true; }
   ai.x = nx; ai.y = ny;
-  if (hitWall) { ai._state = null; ai._targetBall = null; }
+  if (hitWall) { ai._state = null; ai._targetPiece = null; }
 
   ai.angle += ai.omega * TICK_DT;
-
-  if (ai._state === 'climb') {
-    const ldr = ai.team === 'blue' ? LADDER_BLUE : LADDER_RED;
-    const nearLadder = Math.hypot(ai.x - ldr.x, ai.y - ldr.y) < CLIMB_LOCK_RANGE;
-    const stable = Math.hypot(ai.vx, ai.vy) < CLIMB_LOCK_SPEED;
-    if (nearLadder && stable) {
-      ai._climb.progress += TICK_DT;
-      if (ai._climb.progress >= CLIMB_CHARGE_TIME && !ai._climb.latched) {
-        ai._climb.latched = true;
-        if (!ai._climb.scored) {
-          if (ai.team === 'blue') SIM.score.player += CLIMB_SCORE_BONUS;
-          else SIM.score.opponent += CLIMB_SCORE_BONUS;
-          ai._climb.scored = true;
-        }
-      }
-    } else {
-      ai._climb.progress = Math.max(0, ai._climb.progress - TICK_DT * 0.6);
-    }
-  } else {
-    ai._climb.progress = 0;
-  }
 }
 
 function resetAIRobots() {
@@ -688,211 +705,117 @@ function resetAIRobots() {
     ai.x = ai.startX; ai.y = ai.startY; ai.angle = ai.startAngle;
     ai.vx = 0; ai.vy = 0; ai.omega = 0;
     ai.targetX = ai.startX; ai.targetY = ai.startY;
-    ai._state = null; ai._targetBall = null; ai._cargoBall = null; ai._stallTimer = 0;
-    ai._cargoCount = 0; ai._scoreCooldown = 0; ai._cargoBalls = [];
-    ai._climb = { progress: 0, latched: false, scored: false, side: ai.team };
+    ai._state = null; ai._targetPiece = null; ai._stallTimer = 0;
+    ai._heldPieces = [];
     positionAIRobot(ai);
   });
 }
 
-// ─── GAME OBJECTS — TEST GAME ─────────────────────────────────────────────────
+// ─── GAME OBJECTS — V5RC OVERRIDE ────────────────────────────────────────────
 function loadDefaultGameObjects() {
+  if (typeof THREE === 'undefined' || !SIM.gameObjectsGroup) return;
   while (SIM.gameObjectsGroup.children.length)
     SIM.gameObjectsGroup.remove(SIM.gameObjectsGroup.children[0]);
   SIM.gameObjects = [];
+  SIM.goals = [];
   SIM.score.player = 0;
   SIM.score.opponent = 0;
-  SIM.ballWave.count = 1;
-  SIM.ballWave._respawnTimer = 0;
+  SIM.override.heldPieces = [];
+  SIM.override.expanded = false;
+  SIM.override.rollerPos = 0;
+  SIM.override.matchloadsLeft = 40;
+  SIM.toggleOwner = { left: null, right: null, top: null, bottom: null };
 
-  // ── Central hopper goal ───────────────────────────────────────────────────
-  const hopperMetal = new THREE.MeshStandardMaterial({ color: 0xd9a728, roughness: 0.35, metalness: 0.55 });
-  const hopperBody = new THREE.Mesh(
-    new THREE.CylinderGeometry(inToWorld(HOPPER_RADIUS + 2.5), inToWorld(HOPPER_RADIUS - 2), inToWorld(8), 24, 1, true),
-    hopperMetal
-  );
-  hopperBody.position.set(inToWorld(HOPPER_X), inToWorld(4), inToWorld(HOPPER_Y));
-  hopperBody.castShadow = true;
-  SIM.gameObjectsGroup.add(hopperBody);
+  // ── 9 Goals ───────────────────────────────────────────────────────────────
+  const goalGeoCenter   = new THREE.CylinderGeometry(inToWorld(4.5), inToWorld(4.5), inToWorld(GOAL_HEIGHT_CENTER),   16, 1, true);
+  const goalGeoNeutral  = new THREE.CylinderGeometry(inToWorld(4.5), inToWorld(4.5), inToWorld(GOAL_HEIGHT_NEUTRAL),  16, 1, true);
+  const goalGeoAlliance = new THREE.CylinderGeometry(inToWorld(4.5), inToWorld(4.5), inToWorld(GOAL_HEIGHT_ALLIANCE), 16, 1, true);
+  const goalBaseGeo  = new THREE.CylinderGeometry(inToWorld(5.5), inToWorld(5.5), inToWorld(1.5), 16);
+  const goalRimGeo   = new THREE.TorusGeometry(inToWorld(4.5), inToWorld(0.7), 8, 24);
 
-  const hopperLip = new THREE.Mesh(
-    new THREE.TorusGeometry(inToWorld(HOPPER_RADIUS), inToWorld(1.3), 10, 40),
-    new THREE.MeshStandardMaterial({ color: 0xfbbf24, roughness: 0.3, metalness: 0.45 })
-  );
-  hopperLip.rotation.x = Math.PI / 2;
-  hopperLip.position.set(inToWorld(HOPPER_X), inToWorld(7.5), inToWorld(HOPPER_Y));
-  SIM.gameObjectsGroup.add(hopperLip);
+  OVERRIDE_GOALS.forEach(gDef => {
+    const teamColor = gDef.team === 'blue' ? 0x2563eb : gDef.team === 'red' ? 0xdc2626 : 0x444444;
+    const tubeMat   = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.4, metalness: 0.6, side: THREE.DoubleSide });
+    const baseMat   = new THREE.MeshStandardMaterial({ color: teamColor, roughness: 0.35, metalness: 0.55 });
+    const rimMat    = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.3, metalness: 0.7 });
 
-  const hopperNet = new THREE.Mesh(
-    new THREE.CylinderGeometry(inToWorld(HOPPER_RADIUS - 1.5), inToWorld(HOPPER_RADIUS - 4.5), inToWorld(6), 16, 1, true),
-    new THREE.MeshStandardMaterial({ color: 0xf8e7a2, transparent: true, opacity: 0.22, roughness: 1 })
-  );
-  hopperNet.position.set(inToWorld(HOPPER_X), inToWorld(3.5), inToWorld(HOPPER_Y));
-  SIM.gameObjectsGroup.add(hopperNet);
+    const h = gDef.type === 'center' ? GOAL_HEIGHT_CENTER : gDef.type === 'neutral' ? GOAL_HEIGHT_NEUTRAL : GOAL_HEIGHT_ALLIANCE;
+    const geoMap = { center: goalGeoCenter, neutral: goalGeoNeutral, alliance: goalGeoAlliance };
+    const tube = new THREE.Mesh(geoMap[gDef.type] || goalGeoAlliance, tubeMat);
+    tube.position.set(inToWorld(gDef.x), inToWorld(h / 2), inToWorld(gDef.y));
+    tube.castShadow = true;
 
-  // ── Climb bars on both sides of the field ────────────────────────────────
-  [LADDER_BLUE, LADDER_RED].forEach((ldr, i) => {
-    const mat = new THREE.MeshStandardMaterial({
-      color: i === 0 ? 0x6ab3ff : 0xff7b77,
-      roughness: 0.38,
-      metalness: 0.55
-    });
-    const supportZ = [ldr.y - CLIMB_BAR_HALF_SPAN, ldr.y + CLIMB_BAR_HALF_SPAN];
-    supportZ.forEach(z => {
-      const foot = new THREE.Mesh(new THREE.CylinderGeometry(inToWorld(2.4), inToWorld(2.8), inToWorld(1.2), 12), mat.clone());
-      foot.position.set(inToWorld(ldr.x), inToWorld(0.6), inToWorld(z));
-      SIM.gameObjectsGroup.add(foot);
+    const base = new THREE.Mesh(goalBaseGeo, baseMat);
+    base.position.set(inToWorld(gDef.x), inToWorld(0.75), inToWorld(gDef.y));
 
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(inToWorld(0.75), inToWorld(0.75), inToWorld(CLIMB_BAR_HEIGHT), 10), mat.clone());
-      post.position.set(inToWorld(ldr.x), inToWorld(CLIMB_BAR_HEIGHT / 2), inToWorld(z));
-      post.castShadow = true;
-      SIM.gameObjectsGroup.add(post);
-    });
+    const rim = new THREE.Mesh(goalRimGeo, rimMat);
+    rim.rotation.x = Math.PI / 2;
+    rim.position.set(inToWorld(gDef.x), inToWorld(h), inToWorld(gDef.y));
 
-    const bar = new THREE.Mesh(
-      new THREE.CylinderGeometry(inToWorld(0.85), inToWorld(0.85), inToWorld(CLIMB_BAR_HALF_SPAN * 2), 12),
-      new THREE.MeshStandardMaterial({ color: 0xdde4ea, roughness: 0.3, metalness: 0.75 })
-    );
-    bar.rotation.x = Math.PI / 2;
-    bar.position.set(inToWorld(ldr.x), inToWorld(CLIMB_BAR_HEIGHT), inToWorld(ldr.y));
-    bar.castShadow = true;
-    SIM.gameObjectsGroup.add(bar);
+    SIM.gameObjectsGroup.add(tube, base, rim);
+    const goalEntry = { x: gDef.x, y: gDef.y, type: gDef.type, team: gDef.team, pieces: [] };
+    SIM.goals.push(goalEntry);
   });
 
-  // ── 36 balls in a 6×6 grid ────────────────────────────────────────────
-  const ballRadius = inToWorld(BALL_RAD);
-  const ballMat    = new THREE.MeshStandardMaterial({ color: 0xff6b35, roughness: 0.6, metalness: 0.05 });
-  const ballXs = [18, 39, 60, 84, 105, 126];
-  const ballYs = [18, 39, 60, 84, 105, 126];
-
-  ballYs.forEach(by => {
-    ballXs.forEach(bx => {
-      const ball = new THREE.Mesh(new THREE.SphereGeometry(ballRadius, 10, 7), ballMat.clone());
-      ball.position.set(inToWorld(bx), ballRadius, inToWorld(by));
-      ball.castShadow = true;
-      SIM.gameObjectsGroup.add(ball);
-      SIM.gameObjects.push({
-        type: 'ball', x: bx, y: by, z: BALL_RAD, mesh: ball,
-        scored: false, carriedBy: null, shot: null, _lastTouchedBy: null,
-      });
-    });
+  // ── 4 Toggles (center of each wall) ──────────────────────────────────────
+  const toggleGeo = new THREE.BoxGeometry(inToWorld(6), inToWorld(3), inToWorld(1.5));
+  OVERRIDE_TOGGLES.forEach(tDef => {
+    const mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.4, metalness: 0.3 });
+    const mesh = new THREE.Mesh(toggleGeo, mat);
+    const isHoriz = tDef.id === 'left' || tDef.id === 'right';
+    if (!isHoriz) mesh.rotation.y = Math.PI / 2;
+    mesh.position.set(inToWorld(tDef.x), inToWorld(3), inToWorld(tDef.y));
+    mesh.castShadow = true;
+    SIM.gameObjectsGroup.add(mesh);
+    SIM.gameObjects.push({ type: 'toggle', id: tDef.id, quad: tDef.quad, x: tDef.x, y: tDef.y, mesh, _dirty: false });
   });
-}
 
-// ── Ball-pushing physics + hopper scoring ────────────────────────────────────
-function simEnsurePlayerOverlayGroup() {
-  if (!SIM.group) return null;
-  if (!SIM.playerOverlayGroup) {
-    SIM.playerOverlayGroup = new THREE.Group();
-    SIM.playerOverlayGroup.name = 'player_overlay';
-  }
-  if (SIM.playerOverlayGroup.parent !== SIM.group) SIM.group.add(SIM.playerOverlayGroup);
-  return SIM.playerOverlayGroup;
-}
+  // ── 63 Pins (21 red, 21 blue, 21 yellow) ─────────────────────────────────
+  const pinGeo = new THREE.ConeGeometry(inToWorld(0.8), inToWorld(PIN_HEIGHT), 8);
+  const pinColors = { red: 0xef4444, blue: 0x3b82f6, yellow: 0xfbbf24 };
 
-function simUpdatePlayerCargoVisuals() {
-  const group = simEnsurePlayerOverlayGroup();
-  if (!group) return;
-  while (group.children.length) group.remove(group.children[0]);
-
-  const count = SIM.cargo.playerBalls.length;
-  if (!count) return;
-
-  const slots = [
-    [-4.0, 4.2, 1.4],
-    [-1.3, 4.2, 1.4],
-    [ 1.3, 4.2, 1.4],
-    [ 4.0, 4.2, 1.4],
+  const redPinPos = [
+    [88,12],[104,12],[120,12],[88,32],[104,32],[120,32],[88,52],[104,52],[120,52],
+    [88,72],[104,72],[120,72],[88,92],[104,92],[120,92],[88,112],[104,112],[120,112],
+    [88,132],[104,132],[120,132],
+  ];
+  const bluePinPos = [
+    [24,12],[40,12],[56,12],[24,32],[40,32],[56,32],[24,52],[40,52],[56,52],
+    [24,72],[40,72],[56,72],[24,92],[40,92],[56,92],[24,112],[40,112],[56,112],
+    [24,132],[40,132],[56,132],
+  ];
+  const yellowPinPos = [
+    [64,16],[72,16],[80,16],[64,42],[80,42],[72,44],[58,68],[86,68],[72,68],
+    [64,100],[72,100],[80,100],[64,128],[72,128],[80,128],
+    [52,72],[92,72],[72,56],[54,28],[90,28],[72,116],
   ];
 
-  for (let i = 0; i < count && i < slots.length; i++) {
-    const [x, y, z] = slots[i];
-    const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(inToWorld(BALL_RAD * 0.9), 10, 8),
-      new THREE.MeshStandardMaterial({ color: 0xff8a3d, roughness: 0.55, metalness: 0.08, emissive: 0x3a1400, emissiveIntensity: 0.15 })
-    );
-    mesh.position.set(inToWorld(x), inToWorld(y), inToWorld(z));
+  [['red', redPinPos], ['blue', bluePinPos], ['yellow', yellowPinPos]].forEach(([color, positions]) => {
+    const mat = new THREE.MeshStandardMaterial({ color: pinColors[color], roughness: 0.55, metalness: 0.05 });
+    positions.forEach(([px, py]) => {
+      const mesh = new THREE.Mesh(pinGeo, mat.clone());
+      mesh.position.set(inToWorld(px), inToWorld(PIN_HEIGHT / 2), inToWorld(py));
+      mesh.castShadow = true;
+      SIM.gameObjectsGroup.add(mesh);
+      SIM.gameObjects.push({ type: 'pin', color, x: px, y: py, mesh, scored: false, carriedBy: null, scoredBy: null, _lastTouchedBy: null });
+    });
+  });
+
+  // ── 56 Cups ───────────────────────────────────────────────────────────────
+  const cupGeo = new THREE.CylinderGeometry(inToWorld(1.58), inToWorld(1.1), inToWorld(CUP_HEIGHT), 10);
+  const cupMat = new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.6, metalness: 0.05 });
+  const cupXs  = [8, 28, 48, 68, 76, 96, 116, 136];
+  const cupYs  = [10, 28, 46, 72, 98, 116, 134];
+  cupYs.forEach(cy => cupXs.forEach(cx => {
+    const mesh = new THREE.Mesh(cupGeo, cupMat.clone());
+    mesh.position.set(inToWorld(cx), inToWorld(CUP_HEIGHT / 2), inToWorld(cy));
     mesh.castShadow = true;
-    group.add(mesh);
-  }
+    SIM.gameObjectsGroup.add(mesh);
+    SIM.gameObjects.push({ type: 'cup', x: cx, y: cy, mesh, scored: false, carriedBy: null, scoredBy: null, _lastTouchedBy: null });
+  }));
 }
 
-function simSyncCargoState() {
-  SIM.cargo.playerHeld = SIM.cargo.playerBalls.length;
-  simUpdatePlayerCargoVisuals();
-}
-
-function simGetFacingDiffDeg(fromX, fromY, angleDeg, targetX, targetY) {
-  const desired = Math.atan2(targetX - fromX, -(targetY - fromY)) * 180 / Math.PI;
-  let diff = desired - angleDeg;
-  diff = ((diff + 180) % 360 + 360) % 360 - 180;
-  return diff;
-}
-
-function simLaunchStoredBall(owner = 'player') {
-  if (owner !== 'player') return false;
-  const ball = SIM.cargo.playerBalls.shift();
-  if (!ball) return false;
-
-  const front = simGetPlayerPickupPoint();
-  const distToHopper = Math.hypot(HOPPER_X - front.x, HOPPER_Y - front.y);
-  const facingDiff = Math.abs(simGetFacingDiffDeg(front.x, front.y, SIM.robot.angle, HOPPER_X, HOPPER_Y));
-  const willScore = distToHopper <= PLAYER_SHOT_RANGE && facingDiff <= 65;
-
-  const rad = SIM.robot.angle * Math.PI / 180;
-  const missX = Math.max(BALL_RAD, Math.min(FIELD_IN - BALL_RAD, front.x + Math.sin(rad) * 28));
-  const missY = Math.max(BALL_RAD, Math.min(FIELD_IN - BALL_RAD, front.y - Math.cos(rad) * 28));
-  const targetX = willScore ? HOPPER_X : missX;
-  const targetY = willScore ? HOPPER_Y : missY;
-
-  ball.carriedBy = null;
-  ball.shot = {
-    owner,
-    t: 0,
-    duration: Math.max(0.32, Math.min(0.75, distToHopper / 130)),
-    startX: front.x,
-    startY: front.y,
-    startZ: 6.5,
-    targetX,
-    targetY,
-    apex: PLAYER_SHOT_ARC,
-    willScore,
-  };
-  ball.x = front.x;
-  ball.y = front.y;
-  ball.z = ball.shot.startZ;
-  ball._lastTouchedBy = owner;
-  ball.mesh.visible = true;
-  simSyncCargoState();
-  return true;
-}
-
-function simTickBallFlight(o) {
-  const shot = o.shot;
-  if (!shot) return false;
-
-  shot.t += TICK_DT / shot.duration;
-  const t = Math.min(1, shot.t);
-  o.x = shot.startX + (shot.targetX - shot.startX) * t;
-  o.y = shot.startY + (shot.targetY - shot.startY) * t;
-  o.z = BALL_RAD + shot.startZ * (1 - t) + Math.sin(t * Math.PI) * shot.apex;
-  o.mesh.visible = true;
-  o.mesh.position.set(inToWorld(o.x), inToWorld(o.z), inToWorld(o.y));
-
-  if (t < 1) return true;
-
-  o.shot = null;
-  if (shot.willScore) {
-    o.scored = true;
-    o.mesh.visible = false;
-    if (shot.owner === 'player') SIM.score.player++;
-    else SIM.score.opponent++;
-  } else {
-    o.z = BALL_RAD;
-    o.mesh.position.set(inToWorld(o.x), inToWorld(o.z), inToWorld(o.y));
-  }
-  return true;
-}
+// ── Override player + AI mechanics ───────────────────────────────────────────
 
 function simHasMechanismType(type) {
   return !!SIM.config?.mechanisms?.some(m => (m.type || '').toLowerCase() === type);
@@ -910,163 +833,159 @@ function simGetPlayerPickupPoint() {
   };
 }
 
-function simTickPlayerCargo() {
-  const keyIntake = !!SIM.keys['z'];
-  const keyShoot  = !!SIM.keys['x'];
-  const legacyIntakeActive = !simHasMechanismType('intake') && !!SIM.config?.motors?.some(
+function simTickPlayerOverride() {
+  const keyIntake  = !!SIM.keys['z'];
+  const keyDeposit = !!SIM.keys['x'];
+  const legacyIntake = !simHasMechanismType('intake') && !!SIM.config?.motors?.some(
     m => m.role === 'intake' && Math.abs(SIM.motors[m.id]?.voltage || 0) > 25
   );
-  const intakeActive = keyIntake || simIsMechanismActive('intake') || simIsMechanismActive('conveyor') || legacyIntakeActive;
-  if (intakeActive && SIM.cargo.playerBalls.length < SIM.cargo.playerCapacity) {
-    const front = simGetPlayerPickupPoint();
-    const target = SIM.gameObjects
-      .filter(o => o.type === 'ball' && !o.scored && !o.carriedBy && !o.shot)
-      .reduce((best, o) => {
-        const d = Math.hypot(o.x - front.x, o.y - front.y);
-        return d < best.d ? { o, d } : best;
-      }, { o: null, d: Infinity });
-    if (target.o && target.d < PLAYER_PICKUP_RANGE) {
-      target.o.carriedBy = 'player';
-      target.o.mesh.visible = false;
-      SIM.cargo.playerBalls.push(target.o);
-      simSyncCargoState();
+  const intakeActive  = keyIntake  || simIsMechanismActive('intake') || simIsMechanismActive('conveyor') || legacyIntake;
+  const depositActive = keyDeposit || simIsMechanismActive('hopper') || simIsMechanismActive('outtake');
+
+  const held = SIM.override.heldPieces;
+  const front = simGetPlayerPickupPoint();
+
+  // Capture toggle when close
+  SIM.gameObjects.filter(o => o.type === 'toggle').forEach(toggle => {
+    if (Math.hypot(SIM.robot.x - toggle.x, SIM.robot.y - toggle.y) < TOGGLE_CAPTURE_RADIUS) {
+      if (SIM.toggleOwner[toggle.quad] !== 'blue') {
+        SIM.toggleOwner[toggle.quad] = 'blue';
+        toggle._dirty = true;
+      }
+    }
+  });
+
+  // Pick up nearest piece
+  if (intakeActive && held.length < 3) {
+    const best = SIM.gameObjects
+      .filter(o => (o.type === 'pin' || o.type === 'cup') && !o.scored && !o.carriedBy)
+      .map(o => ({ o, d: Math.hypot(o.x - front.x, o.y - front.y) }))
+      .filter(e => e.d < PLAYER_PICKUP_RANGE)
+      .sort((a, b) => a.d - b.d)[0];
+    if (best) {
+      best.o.carriedBy = 'player';
+      best.o.mesh.visible = false;
+      held.push(best.o);
     }
   }
 
-  const shooterActive = keyShoot || simIsMechanismActive('hopper') || simIsMechanismActive('flywheel') || simIsMechanismActive('outtake');
-  if (SIM.cargo.scoreCooldown > 0) SIM.cargo.scoreCooldown -= TICK_DT;
-  if (SIM.cargo.shotCooldown > 0) SIM.cargo.shotCooldown -= TICK_DT;
-
-  if (shooterActive && SIM.cargo.playerBalls.length > 0 && SIM.cargo.shotCooldown <= 0) {
-    if (simLaunchStoredBall('player')) {
-      SIM.cargo.shotCooldown = PLAYER_SHOT_INTERVAL;
-      SIM.cargo.scoreCooldown = HOPPER_SCORE_INTERVAL;
-    }
-  }
-}
-
-function simGetNearestLadder(x, y) {
-  const blueD = Math.hypot(x - LADDER_BLUE.x, y - LADDER_BLUE.y);
-  const redD  = Math.hypot(x - LADDER_RED.x,  y - LADDER_RED.y);
-  return blueD <= redD
-    ? { side: 'blue', anchor: LADDER_BLUE, dist: blueD }
-    : { side: 'red',  anchor: LADDER_RED,  dist: redD };
-}
-
-function simGetClimbAttachPose(side) {
-  const anchor = side === 'red' ? LADDER_RED : LADDER_BLUE;
-  return {
-    x: anchor.x + (side === 'red' ? -2.6 : 2.6),
-    y: anchor.y,
-    angle: side === 'red' ? -90 : 90,
-  };
-}
-
-function simGetClimbLift(climbState) {
-  if (!climbState) return 0;
-  if (climbState.latched) return 11.5;
-  const t = Math.max(0, Math.min(1, (climbState.progress || 0) / CLIMB_CHARGE_TIME));
-  return t * 8.5;
-}
-
-function simTickPlayerClimb() {
-  const climbActive = !!SIM.keys['c'] || SIM.controls.climbPressed || simIsMechanismActive('climb');
-  const climb = SIM.climb.player;
-  const timeLeft = SIM.match.duration - SIM.match.elapsed;
-  const freeRoam = SIM.match.mode === 'freeRoam';
-  if (!climbActive || (!freeRoam && timeLeft > 20) || climb.latched) {
-    if (!climb.latched) { climb.progress = 0; climb.side = null; }
-    return;
-  }
-
-  const nearest = simGetNearestLadder(SIM.robot.x, SIM.robot.y);
-  climb.side = nearest.side;
-  const nearLadder = nearest.dist < CLIMB_LOCK_RANGE;
-  const stable = Math.hypot(SIM.robot.vx, SIM.robot.vy) < CLIMB_LOCK_SPEED;
-  if (!nearLadder || !stable) {
-    climb.progress = Math.max(0, climb.progress - TICK_DT * 0.8);
-    return;
-  }
-
-  climb.progress += TICK_DT;
-  if (climb.progress >= CLIMB_CHARGE_TIME) {
-    climb.latched = true;
-    const pose = simGetClimbAttachPose(climb.side);
-    SIM.robot.x = pose.x;
-    SIM.robot.y = pose.y;
-    SIM.robot.angle = pose.angle;
-    SIM.robot.vx = 0; SIM.robot.vy = 0; SIM.robot.omega = 0;
-    _targetVx = 0; _targetVy = 0; _targetOmega = 0;
-    if (!climb.scored) {
-      SIM.score.player += CLIMB_SCORE_BONUS;
-      climb.scored = true;
+  // Deposit all held pieces into nearest goal
+  if (depositActive && held.length > 0) {
+    const near = SIM.goals
+      .map(g => ({ g, d: Math.hypot(SIM.robot.x - g.x, SIM.robot.y - g.y) }))
+      .filter(e => e.d < GOAL_SCORE_RADIUS)
+      .sort((a, b) => a.d - b.d)[0];
+    if (near) {
+      while (held.length) {
+        const piece = held.pop();
+        piece.scored  = true;
+        piece.carriedBy = null;
+        piece.scoredBy  = 'blue';
+        near.g.pieces.push(piece);
+      }
     }
   }
 }
 
 function tickGameObjects() {
-  simTickPlayerCargo();
-  simTickPlayerClimb();
+  simTickPlayerOverride();
 
-  const robots = [{ r: SIM.robot, tag: 'player' }, ...SIM.aiRobots.map(r => ({ r, tag: 'ai' }))];
+  // AI piece pickup + deposit
+  SIM.aiRobots.forEach(ai => {
+    const held = ai._heldPieces || (ai._heldPieces = []);
+
+    // Toggle capture
+    SIM.gameObjects.filter(o => o.type === 'toggle').forEach(toggle => {
+      if (Math.hypot(ai.x - toggle.x, ai.y - toggle.y) < TOGGLE_CAPTURE_RADIUS) {
+        if (SIM.toggleOwner[toggle.quad] !== ai.team) {
+          SIM.toggleOwner[toggle.quad] = ai.team;
+          toggle._dirty = true;
+        }
+      }
+    });
+
+    // Pickup when collecting
+    if (ai._state === 'collect' && held.length < 3) {
+      const best = SIM.gameObjects
+        .filter(o => (o.type === 'pin' || o.type === 'cup') && !o.scored && !o.carriedBy)
+        .map(o => ({ o, d: Math.hypot(o.x - ai.x, o.y - ai.y) }))
+        .filter(e => e.d < 14)
+        .sort((a, b) => a.d - b.d)[0];
+      if (best) {
+        best.o.carriedBy = ai;
+        best.o.mesh.visible = false;
+        held.push(best.o);
+        ai._targetPiece = null;
+        if (held.length >= 3) ai._state = null;
+      }
+    }
+
+    // Deposit when scoring
+    if (ai._state === 'score' && held.length > 0) {
+      const teamGoals = SIM.goals.filter(g => g.team === ai.team || g.team === 'neutral');
+      const near = teamGoals
+        .map(g => ({ g, d: Math.hypot(ai.x - g.x, ai.y - g.y) }))
+        .filter(e => e.d < GOAL_SCORE_RADIUS)
+        .sort((a, b) => a.d - b.d)[0];
+      if (near) {
+        while (held.length) {
+          const piece = held.pop();
+          piece.scored = true;
+          piece.carriedBy = null;
+          piece.scoredBy = ai.team;
+          near.g.pieces.push(piece);
+        }
+        ai._state = null;
+      }
+    }
+  });
+
+  // Push loose pieces with robot contact + check if pushed into a goal
+  const robots = [{ r: SIM.robot, tag: 'player' }, ...SIM.aiRobots.map(r => ({ r, tag: r.team }))];
   SIM.gameObjects.forEach(o => {
-    if (o.type !== 'ball' || o.scored) return;
-    if (simTickBallFlight(o)) return;
-    if (o.carriedBy) return;
+    if (o.type !== 'pin' && o.type !== 'cup') return;
+    if (o.scored || o.carriedBy) return;
 
     robots.forEach(({ r, tag }) => {
       const dx = o.x - r.x, dy = o.y - r.y;
       const d  = Math.sqrt(dx * dx + dy * dy);
-      if (d < PUSH_DIST && d > 0.01) {
-        const spd      = Math.sqrt(r.vx * r.vx + r.vy * r.vy);
-        const overlap  = (PUSH_DIST - d);
-        const impulse  = overlap * 0.5 + spd * 0.3;
+      if (d < PIECE_PUSH_DIST && d > 0.01) {
+        const spd = Math.sqrt(r.vx ** 2 + r.vy ** 2);
+        const impulse = (PIECE_PUSH_DIST - d) * 0.4 + spd * 0.25;
         o.x += (dx / d) * impulse * TICK_DT;
         o.y += (dy / d) * impulse * TICK_DT;
         o._lastTouchedBy = tag;
       }
     });
 
-    o.x = Math.max(BALL_RAD, Math.min(FIELD_IN - BALL_RAD, o.x));
-    o.y = Math.max(BALL_RAD, Math.min(FIELD_IN - BALL_RAD, o.y));
+    o.x = Math.max(2, Math.min(FIELD_IN - 2, o.x));
+    o.y = Math.max(2, Math.min(FIELD_IN - 2, o.y));
 
-    // Score into hopper
-    if (Math.hypot(o.x - HOPPER_X, o.y - HOPPER_Y) < HOPPER_RADIUS) {
+    const goal = SIM.goals.find(g => Math.hypot(g.x - o.x, g.y - o.y) < GOAL_SCORE_RADIUS * 0.55);
+    if (goal) {
       o.scored = true;
+      o.scoredBy = o._lastTouchedBy === 'player' ? 'blue'
+                 : o._lastTouchedBy === 'red'    ? 'red'
+                 : o._lastTouchedBy === 'blue'   ? 'blue' : null;
+      goal.pieces.push(o);
       o.mesh.visible = false;
-      if (o._lastTouchedBy === 'player') SIM.score.player++;
-      else SIM.score.opponent++;
     } else {
-      o.mesh.position.set(inToWorld(o.x), inToWorld(BALL_RAD), inToWorld(o.y));
+      o.mesh.position.set(inToWorld(o.x), inToWorld(o.type === 'pin' ? PIN_HEIGHT / 2 : CUP_HEIGHT / 2), inToWorld(o.y));
     }
   });
 
-  // Wave respawn: when every ball is gone and there's still time to play, bring them back
-  if (SIM.match.running && (SIM.match.duration - SIM.match.elapsed) > 22) {
-    const free = SIM.gameObjects.filter(o => o.type === 'ball' && !o.scored && !o.carriedBy && !o.shot).length;
-    if (free === 0) {
-      SIM.ballWave._respawnTimer += TICK_DT;
-      if (SIM.ballWave._respawnTimer >= 2.5) simRespawnBalls();
-    } else {
-      SIM.ballWave._respawnTimer = 0;
-    }
-  }
-}
-
-function simRespawnBalls() {
-  const positions = [];
-  [18, 39, 60, 84, 105, 126].forEach(by => [18, 39, 60, 84, 105, 126].forEach(bx => positions.push({ x: bx, y: by })));
-  let p = 0;
-  SIM.gameObjects.forEach(o => {
-    if (o.type !== 'ball' || !o.scored || p >= positions.length) return;
-    const pos = positions[p++];
-    o.x = pos.x; o.y = pos.y; o.z = BALL_RAD;
-    o.scored = false; o.carriedBy = null; o.shot = null; o._lastTouchedBy = null;
-    o.mesh.visible = true;
-    o.mesh.position.set(inToWorld(pos.x), inToWorld(BALL_RAD), inToWorld(pos.y));
+  // Update toggle mesh colors
+  SIM.gameObjects.filter(o => o.type === 'toggle' && o._dirty).forEach(toggle => {
+    const owner = SIM.toggleOwner[toggle.quad];
+    const color = owner === 'blue' ? 0x3B82F6 : owner === 'red' ? 0xEF4444 : 0x888888;
+    if (toggle.mesh?.material) toggle.mesh.material.color.setHex(color);
+    toggle._dirty = false;
   });
-  SIM.ballWave.count++;
-  SIM.ballWave._respawnTimer = 0;
+
+  // Live score refresh
+  const sc = simCalcScore();
+  SIM.score.player   = sc.player;
+  SIM.score.opponent = sc.opponent;
 }
 
 // ─── PHYSICS CONSTANTS (VEX-accurate, overridden by config on load) ──────────
@@ -1175,16 +1094,9 @@ function resolveAllRobotCollisions() {
   clamp(r, pW, pH);
   SIM.aiRobots.forEach(ai => clamp(ai, 15, 15));
 
-  const obstacles = [
-    { x: HOPPER_X, y: HOPPER_Y, radius: HOPPER_SOLID_RADIUS },
-    { x: LADDER_BLUE.x, y: LADDER_BLUE.y - CLIMB_BAR_HALF_SPAN, radius: CLIMB_POST_SOLID_RADIUS },
-    { x: LADDER_BLUE.x, y: LADDER_BLUE.y + CLIMB_BAR_HALF_SPAN, radius: CLIMB_POST_SOLID_RADIUS },
-    { x: LADDER_RED.x,  y: LADDER_RED.y  - CLIMB_BAR_HALF_SPAN, radius: CLIMB_POST_SOLID_RADIUS },
-    { x: LADDER_RED.x,  y: LADDER_RED.y  + CLIMB_BAR_HALF_SPAN, radius: CLIMB_POST_SOLID_RADIUS },
-  ];
+  // Goals act as solid obstacles for robot collision
+  const obstacles = SIM.goals.map(g => ({ x: g.x, y: g.y, radius: GOAL_SOLID_RADIUS }));
   const resolveVsObstacle = (bot, width, length) => {
-    if (bot === SIM.robot && SIM.climb.player?.latched) return;
-    if (bot !== SIM.robot && bot._climb?.latched) return;
     const botRadius = Math.max(width, length) * 0.42;
     obstacles.forEach(obs => {
       const dx = bot.x - obs.x, dy = bot.y - obs.y;
@@ -1217,11 +1129,6 @@ function simPhysicsTick() {
   }
 
   const r = SIM.robot;
-
-  if (SIM.climb.player.latched) {
-    r.vx = 0; r.vy = 0; r.omega = 0;
-    _targetVx = 0; _targetVy = 0; _targetOmega = 0;
-  }
 
   // First-order lag: separate tau for driving vs coasting so acceleration and
   // braking feel match real V5 motor + carpet behavior independently.
@@ -1631,7 +1538,6 @@ async function simLoadOBJ(objPath, mtlPath) {
   SIM.group.add(orientGroup);
 
   simPositionRobotMesh();
-  simSyncCargoState();
   buildMechanicsVisuals();
   simHideLoading();
   simSetStatus('Robot model loaded');
@@ -1752,12 +1658,8 @@ function simResetRobot() {
   SIM.robot.y = FIELD_IN / 2;
   SIM.robot.angle = 90;
   SIM.robot.vx = 0; SIM.robot.vy = 0; SIM.robot.omega = 0; SIM.robot.snapTarget = null;
-  SIM.cargo.playerBalls = [];
-  SIM.cargo.scoreCooldown = 0;
-  SIM.cargo.shotCooldown = 0;
-  simSyncCargoState();
-  SIM.controls.climbPressed = false;
-  SIM.climb.player = { progress: 0, latched: false, scored: false, side: null };
+  SIM.override.heldPieces = [];
+  SIM.toggleOwner = { left: null, right: null, top: null, bottom: null };
   SIM.sensors.encFwd = 0; SIM.sensors.imuDrift = 0;
   _targetVx = 0; _targetVy = 0; _targetOmega = 0;
   simPositionRobotMesh();
@@ -1908,15 +1810,18 @@ function simUpdateSidebar() {
   set('simStatY',     r.y.toFixed(1) + '"');
   set('simStatH',     ((r.angle % 360 + 360) % 360).toFixed(1) + '°');
   set('simStatSpd',   (Math.sqrt(r.vx**2 + r.vy**2)).toFixed(1) + ' in/s');
-  set('simStatCargo', `${SIM.cargo.playerBalls.length}/${SIM.cargo.playerCapacity}`);
+  set('simStatCargo', `${SIM.override.heldPieces.length}/3`);
+  set('simStatExpand',  SIM.override.expanded ? 'Expanded' : 'Normal');
+  set('simStatRoller',  ROLLER_POSITIONS[SIM.override.rollerPos] || 'Out');
+  set('simStatML',      String(SIM.override.matchloadsLeft));
   set('simStatPScore', String(SIM.score.player));
   set('simStatOScore', String(SIM.score.opponent));
-  const climbState = SIM.climb.player.latched
-    ? `Hanging (${(SIM.climb.player.side || 'blue').toUpperCase()})`
-    : SIM.climb.player.progress > 0.05
-      ? `Climbing ${(SIM.climb.player.progress / CLIMB_CHARGE_TIME * 100).toFixed(0)}%`
-      : 'Ready';
-  set('simStatClimb', climbState);
+  const tOwners = ['L','R','T','B'].map((lbl, i) => {
+    const key = ['left','right','top','bottom'][i];
+    const o = SIM.toggleOwner[key];
+    return lbl + ':' + (o === 'blue' ? 'B' : o === 'red' ? 'R' : '-');
+  }).join(' ');
+  set('simStatClimb', tOwners);
   set('simSensorImu', s.imu.toFixed(1) + '°');
   set('simSensorOdomX', s.odomX.toFixed(1) + '"');
   set('simSensorOdomY', s.odomY.toFixed(1) + '"');
@@ -1952,10 +1857,7 @@ function simUpdateSidebar() {
   const hudTimer = document.getElementById('simHudTimer');
   if (hudTimer) hudTimer.style.color = isFreeRoam ? '#4ade80' : endgame ? '#ef4444' : 'var(--gold)';
   const hudWave = document.getElementById('simHudWave');
-  if (hudWave) {
-    hudWave.style.display = SIM.ballWave.count > 1 ? '' : 'none';
-    hudWave.textContent = `· W${SIM.ballWave.count}`;
-  }
+  if (hudWave) hudWave.style.display = 'none';
 }
 
 // ─── CONFIG PANEL ─────────────────────────────────────────────────────────────
@@ -2041,6 +1943,40 @@ function simTogglePiston(id, btn) {
 function simKeyTogglePistons() {
   if (!SIM.config?.pistons?.length) return;
   SIM.config.pistons.forEach(p => simTogglePiston(p.id, null));
+}
+
+function simExpand() {
+  if (SIM.override.expanded) return;
+  SIM.override.expanded = true;
+  simSetStatus('Expanded');
+  if (typeof showToast === 'function') showToast('Expanded', 'ok');
+}
+
+function simCompress() {
+  if (!SIM.override.expanded) return;
+  SIM.override.expanded = false;
+  simSetStatus('Compressed');
+}
+
+function simCycleRoller() {
+  SIM.override.rollerPos = (SIM.override.rollerPos + 1) % ROLLER_POSITIONS.length;
+  simSetStatus('Roller: ' + ROLLER_POSITIONS[SIM.override.rollerPos]);
+}
+
+function simMatchload() {
+  if (SIM.override.matchloadsLeft <= 0) { simSetStatus('No matchloads left'); return; }
+  SIM.override.matchloadsLeft--;
+  const a = SIM.robot.angle * Math.PI / 180;
+  const px = Math.max(4, Math.min(FIELD_IN - 4, SIM.robot.x + Math.sin(a) * 14));
+  const py = Math.max(4, Math.min(FIELD_IN - 4, SIM.robot.y - Math.cos(a) * 14));
+  const geo = new THREE.CylinderGeometry(inToWorld(1.58), inToWorld(1.1), inToWorld(CUP_HEIGHT), 10);
+  const mat = new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.6, metalness: 0.05 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(inToWorld(px), inToWorld(CUP_HEIGHT / 2), inToWorld(py));
+  mesh.castShadow = true;
+  SIM.gameObjectsGroup.add(mesh);
+  SIM.gameObjects.push({ type: 'cup', x: px, y: py, mesh, scored: false, carriedBy: null, scoredBy: null, _lastTouchedBy: null });
+  simSetStatus('Matchload (' + SIM.override.matchloadsLeft + ' left)');
 }
 
 // ─── PID CONTROLS ─────────────────────────────────────────────────────────────
@@ -2366,6 +2302,7 @@ function annSave() {
   };
 
   SIM.config = config;
+  simApplyDrivetrainConfig(config.drivetrain);
   (config.motors  || []).forEach(m => { SIM.motors[m.id]  = { voltage: 0 }; });
   (config.pistons || []).forEach(p => { SIM.pistons[p.id] = { extended: false }; });
 
@@ -2728,8 +2665,35 @@ function _showDiag(issues) {
 // ─── TELEMETRY ────────────────────────────────────────────────────────────────
 
 function simCalcScore() {
-  // Hopper scoring: tracked in SIM.score by tickGameObjects when balls are sunk
-  return { player: SIM.score.player, opponent: SIM.score.opponent };
+  let player = 0, opponent = 0;
+  SIM.goals.forEach(goal => {
+    goal.pieces.forEach(piece => {
+      if (piece.type === 'pin') {
+        if (piece.color === 'blue') player += PIN_SCORE_ALLIANCE;
+        else if (piece.color === 'red') opponent += PIN_SCORE_ALLIANCE;
+        else if (piece.color === 'yellow') {
+          const owner = SIM.toggleOwner[getQuadrant(goal.x, goal.y)];
+          if (owner === 'blue') player += PIN_SCORE_YELLOW;
+          else if (owner === 'red') opponent += PIN_SCORE_YELLOW;
+        }
+      } else if (piece.type === 'cup') {
+        if (piece.scoredBy === 'blue') player += CUP_SCORE_VALUE;
+        else if (piece.scoredBy === 'red') opponent += CUP_SCORE_VALUE;
+      }
+    });
+  });
+  // Midfield bonus at match end
+  if (!SIM.match.running && SIM.match.elapsed > 0) {
+    if (Math.hypot(SIM.robot.x - FIELD_IN / 2, SIM.robot.y - FIELD_IN / 2) < MIDFIELD_RADIUS)
+      player += MIDFIELD_BONUS;
+    SIM.aiRobots.forEach(ai => {
+      if (Math.hypot(ai.x - FIELD_IN / 2, ai.y - FIELD_IN / 2) < MIDFIELD_RADIUS) {
+        if (ai.team === 'blue') player += MIDFIELD_BONUS;
+        else opponent += MIDFIELD_BONUS;
+      }
+    });
+  }
+  return { player, opponent };
 }
 
 function simSnapshotState() {
@@ -2794,6 +2758,235 @@ function simApplyMLAction(ai) {
   ai.x = nx; ai.y = ny;
   ai.angle += ai.omega * TICK_DT;
 }
+
+// ─── ANALYTICS PANEL ─────────────────────────────────────────────────────────
+
+function simOpenAnalytics() {
+  const overlay = document.getElementById('simAnalyticsOverlay');
+  if (overlay) overlay.style.display = 'flex';
+  simRefreshSessions();
+}
+
+function simCloseAnalytics() {
+  const overlay = document.getElementById('simAnalyticsOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+async function simRefreshSessions() {
+  const listEl = document.getElementById('simSessionList');
+  if (!listEl) return;
+
+  if (!window.electronAPI?.simListSessions) {
+    listEl.innerHTML = '<span style="color:var(--t3);font-size:11px;">Not available in web mode.</span>';
+    return;
+  }
+
+  listEl.textContent = 'Loading…';
+  const list = await window.electronAPI.simListSessions();
+  if (!list?.length) {
+    listEl.innerHTML = '<span style="color:var(--t3);font-size:11px;">No sessions recorded yet. Run a driver match to create one.</span>';
+    return;
+  }
+
+  listEl.innerHTML = list.map((s, i) => {
+    const d = new Date(s.date || s.id);
+    const dateStr = isNaN(d) ? '—' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const timeStr = isNaN(d) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    const modeLabel = (s.mode || 'driver').toUpperCase();
+    return `<button class="btn-o" style="text-align:left;padding:7px 9px;font-size:11px;display:flex;flex-direction:column;gap:1px;"
+        onclick="simLoadAnalyticsSession(${i})">
+      <span style="font-weight:700;color:var(--t1);">${dateStr} · ${timeStr}</span>
+      <span style="color:var(--t3);">${modeLabel}</span>
+    </button>`;
+  }).join('');
+
+  listEl._sessions = list;
+}
+
+async function simLoadAnalyticsSession(idx) {
+  const listEl = document.getElementById('simSessionList');
+  const sessions = listEl?._sessions;
+  if (!sessions?.[idx]) return;
+
+  const data = await window.electronAPI.simLoadSession(sessions[idx].file);
+  if (!data?.frames?.length) return;
+
+  document.getElementById('simAnalyticsEmpty').style.display  = 'none';
+  const detail = document.getElementById('simAnalyticsDetail');
+  detail.style.display = 'flex';
+
+  _simDrawHeatmap(data.frames);
+  _simDrawSpeedTimeline(data.frames);
+  _simRenderStats(data);
+  _simRenderTips(data.frames);
+}
+
+function _simDrawHeatmap(frames) {
+  const canvas = document.getElementById('simHeatmapCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const GRID = 16;
+  const heat = new Array(GRID * GRID).fill(0);
+
+  frames.forEach(f => {
+    const gx = Math.min(GRID - 1, Math.floor(f.p.x / FIELD_IN * GRID));
+    const gy = Math.min(GRID - 1, Math.floor(f.p.y / FIELD_IN * GRID));
+    heat[gy * GRID + gx]++;
+  });
+  const maxH = Math.max(1, ...heat);
+  const cw = W / GRID, ch = H / GRID;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Field background
+  ctx.fillStyle = '#0a0f1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Heat cells
+  heat.forEach((v, i) => {
+    if (!v) return;
+    const t = v / maxH;
+    const gx = i % GRID, gy = Math.floor(i / GRID);
+    // Interpolate cold→warm: dark blue → gold → red
+    let r, g, b;
+    if (t < 0.5) {
+      const tt = t * 2;
+      r = Math.round(30  + tt * (245 - 30));
+      g = Math.round(58  + tt * (158 - 58));
+      b = Math.round(138 + tt * (11  - 138));
+    } else {
+      const tt = (t - 0.5) * 2;
+      r = Math.round(245 + tt * (239 - 245));
+      g = Math.round(158 + tt * (68  - 158));
+      b = Math.round(11  + tt * (68  - 11));
+    }
+    ctx.fillStyle = `rgba(${r},${g},${b},${0.3 + t * 0.7})`;
+    ctx.fillRect(gx * cw, gy * ch, cw, ch);
+  });
+
+  // Field grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 0.5;
+  for (let i = 1; i < GRID; i++) {
+    ctx.beginPath(); ctx.moveTo(i * cw, 0); ctx.lineTo(i * cw, H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * ch); ctx.lineTo(W, i * ch); ctx.stroke();
+  }
+
+  // Field border
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0, 0, W, H);
+}
+
+function _simDrawSpeedTimeline(frames) {
+  const canvas = document.getElementById('simSpeedCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * window.devicePixelRatio || 560;
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (frames.length < 2) return;
+  const speeds = frames.map(f => Math.sqrt(f.p.vx ** 2 + f.p.vy ** 2));
+  const maxS = Math.max(DRIVE_SPEED, ...speeds);
+
+  // Zero reference
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, H); ctx.lineTo(W, H); ctx.stroke();
+
+  // Speed curve
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  speeds.forEach((s, i) => {
+    const px = (i / (speeds.length - 1)) * W;
+    const py = H - (s / maxS) * (H - 4);
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+
+  // Fill under curve
+  ctx.fillStyle = 'rgba(245,158,11,0.1)';
+  ctx.beginPath();
+  speeds.forEach((s, i) => {
+    const px = (i / (speeds.length - 1)) * W;
+    const py = H - (s / maxS) * (H - 4);
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  });
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fill();
+}
+
+function _simRenderStats(data) {
+  const el = document.getElementById('simAnalyticsStats');
+  if (!el) return;
+  const frames = data.frames;
+  const duration = frames[frames.length - 1]?.t || 0;
+  const speeds = frames.map(f => Math.sqrt(f.p.vx ** 2 + f.p.vy ** 2));
+  const avgSpeed = speeds.reduce((a, b) => a + b, 0) / Math.max(speeds.length, 1);
+  const maxSpeed = Math.max(...speeds);
+  const moving = speeds.filter(s => s > 2).length / Math.max(speeds.length, 1);
+  const lastSc  = frames[frames.length - 1]?.sc || { player: 0, opponent: 0 };
+
+  const row = (label, value, color) =>
+    `<div style="display:flex;justify-content:space-between;font-size:11px;padding:3px 0;border-bottom:1px solid var(--b1);">
+      <span style="color:var(--t3);">${label}</span>
+      <span style="font-family:var(--fm);color:${color || 'var(--t1)'};">${value}</span>
+    </div>`;
+
+  el.innerHTML =
+    row('Duration',      duration.toFixed(1) + 's') +
+    row('Avg Speed',     avgSpeed.toFixed(1) + ' in/s', '#f59e0b') +
+    row('Peak Speed',    maxSpeed.toFixed(1) + ' in/s') +
+    row('Active %',      (moving * 100).toFixed(0) + '%', moving > 0.6 ? '#4ade80' : '#f87171') +
+    row('Final Score',   lastSc.player + ' – ' + lastSc.opponent,
+        lastSc.player >= lastSc.opponent ? '#4ade80' : '#f87171') +
+    row('Frames',        frames.length);
+}
+
+function _simRenderTips(frames) {
+  const el = document.getElementById('simAnalyticsTips');
+  if (!el) return;
+
+  const speeds  = frames.map(f => Math.sqrt(f.p.vx ** 2 + f.p.vy ** 2));
+  const avgSpeed = speeds.reduce((a, b) => a + b, 0) / Math.max(speeds.length, 1);
+  const idle    = speeds.filter(s => s < 1).length / Math.max(speeds.length, 1);
+  const pctMax  = avgSpeed / DRIVE_SPEED;
+
+  const tips = [];
+
+  if (idle > 0.35)
+    tips.push({ icon: '⚡', color: '#f59e0b', text: `${(idle * 100).toFixed(0)}% of your time was spent stationary — aim to keep moving between cycles.` });
+
+  if (pctMax < 0.45)
+    tips.push({ icon: '🚀', color: '#3b82f6', text: `Average speed was only ${(pctMax * 100).toFixed(0)}% of max — practice driving at higher speeds to cut cycle times.` });
+
+  // Field coverage check
+  const GRID = 8;
+  const visited = new Set();
+  frames.forEach(f => {
+    const gx = Math.min(GRID - 1, Math.floor(f.p.x / FIELD_IN * GRID));
+    const gy = Math.min(GRID - 1, Math.floor(f.p.y / FIELD_IN * GRID));
+    visited.add(gy * GRID + gx);
+  });
+  const coverage = visited.size / (GRID * GRID);
+  if (coverage < 0.3)
+    tips.push({ icon: '🗺', color: '#a855f7', text: `You only covered ${(coverage * 100).toFixed(0)}% of the field — explore more zones to contest pins and goals.` });
+
+  if (!tips.length)
+    tips.push({ icon: '✓', color: '#4ade80', text: 'Solid session. Keep up the consistent movement and field coverage.' });
+
+  el.innerHTML = tips.map(t =>
+    `<div style="display:flex;gap:8px;align-items:flex-start;background:var(--s3);border-radius:6px;padding:8px 10px;font-size:11px;line-height:1.5;">
+      <span style="font-size:14px;">${t.icon}</span>
+      <span style="color:${t.color};">${t.text}</span>
+    </div>`
+  ).join('');
+}
+
+// ─── OBSERVATION VECTOR ───────────────────────────────────────────────────────
 
 // Returns a 15-element normalized observation vector for the given AI opponent.
 // This is what the policy network sees each step.
