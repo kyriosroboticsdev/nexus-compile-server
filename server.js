@@ -297,7 +297,9 @@ all:
 `;
 
 // ── Notebook publish / public view ────────────────────────────────────────────
-const NOTEBOOKS_DIR = process.env.NOTEBOOKS_DIR || path.join(os.tmpdir(), 'nexus-notebooks');
+// Use a subdirectory of the app root so data survives Render spin-down/spin-up cycles.
+// (Only full redeploys reset the filesystem on Render free tier.)
+const NOTEBOOKS_DIR = process.env.NOTEBOOKS_DIR || path.join(__dirname, '_nb_data');
 fs.mkdirSync(NOTEBOOKS_DIR, { recursive: true });
 
 function safeTeamCode(raw) {
